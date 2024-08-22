@@ -6,6 +6,7 @@ package boomer
 import (
 	"fmt"
 	"github.com/sandwich-go/boost/retry"
+	"github.com/sandwich-go/boost/xsync"
 	"log"
 	"sync"
 
@@ -24,6 +25,7 @@ type gomqSocketClient struct {
 	toMaster               chan message
 	disconnectedFromMaster chan bool
 	shutdownChan           chan bool
+	state                  xsync.AtomicInt32
 	wg                     sync.WaitGroup
 }
 
@@ -44,6 +46,7 @@ func (c *gomqSocketClient) connect() (err error) {
 	c.shutdownChan = make(chan bool)
 	addr := fmt.Sprintf("tcp://%s:%d", c.masterHost, c.masterPort)
 	c.dealerSocket = gomq.NewDealer(zmtp.NewSecurityNull(), c.identity)
+	c.state.Set(1)
 
 	if err = c.dealerSocket.Connect(addr); err != nil {
 		log.Println("Error connecting to master:", err)
@@ -71,10 +74,15 @@ func (c *gomqSocketClient) reconnect() error {
 }
 
 func (c *gomqSocketClient) close() {
-	close(c.shutdownChan)
-	if c.dealerSocket != nil {
-		c.dealerSocket.Close()
+	if c.state.CompareAndSwap(1, 0) {
+		// run一次关一次
+		close(c.shutdownChan)
+
+		if c.dealerSocket != nil {
+			c.dealerSocket.Close()
+		}
 	}
+
 	c.wg.Wait() // 等待 send 和 recv 退出
 }
 
