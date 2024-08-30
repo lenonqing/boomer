@@ -29,12 +29,11 @@ type Boomer struct {
 	masterHost  string
 	masterPort  int
 	mode        Mode
-	rateLimiter RateLimiter
 	slaveRunner *slaveRunner
 
 	localRunner *localRunner
 	spawnCount  int
-	spawnRate   float64
+	spawnRate   int
 
 	cpuProfileFile     string
 	cpuProfileDuration time.Duration
@@ -42,7 +41,13 @@ type Boomer struct {
 	memoryProfileFile     string
 	memoryProfileDuration time.Duration
 
-	outputs []Output
+	outputs   []Output
+	spawnChan chan<- *SpawnArgs
+}
+
+type SpawnArgs struct {
+	Count int
+	Rate  float64
 }
 
 // NewBoomer returns a new Boomer.
@@ -55,18 +60,12 @@ func NewBoomer(masterHost string, masterPort int) *Boomer {
 }
 
 // NewStandaloneBoomer returns a new Boomer, which can run without master.
-func NewStandaloneBoomer(spawnCount int, spawnRate float64) *Boomer {
+func NewStandaloneBoomer(spawnCount int, spawnRate int) *Boomer {
 	return &Boomer{
 		spawnCount: spawnCount,
 		spawnRate:  spawnRate,
 		mode:       StandaloneMode,
 	}
-}
-
-// SetRateLimiter allows user to use their own rate limiter.
-// It must be called before the test is started.
-func (b *Boomer) SetRateLimiter(rateLimiter RateLimiter) {
-	b.rateLimiter = rateLimiter
 }
 
 // SetMode only accepts boomer.DistributedMode and boomer.StandaloneMode.
@@ -99,7 +98,7 @@ func (b *Boomer) EnableMemoryProfile(memoryProfileFile string, duration time.Dur
 }
 
 // Run accepts a slice of Task and connects to the locust master.
-func (b *Boomer) Run(tasks ...*Task) {
+func (b *Boomer) Run(spawnChan chan *SpawnArgs) {
 	if b.cpuProfileFile != "" {
 		err := StartCPUProfile(b.cpuProfileFile, b.cpuProfileDuration)
 		if err != nil {
@@ -115,13 +114,13 @@ func (b *Boomer) Run(tasks ...*Task) {
 
 	switch b.mode {
 	case DistributedMode:
-		b.slaveRunner = newSlaveRunner(b.masterHost, b.masterPort, tasks, b.rateLimiter)
+		b.slaveRunner = newSlaveRunner(b.masterHost, b.masterPort, spawnChan)
 		for _, o := range b.outputs {
 			b.slaveRunner.addOutput(o)
 		}
 		b.slaveRunner.run()
 	case StandaloneMode:
-		b.localRunner = newLocalRunner(tasks, b.rateLimiter, b.spawnCount, b.spawnRate)
+		b.localRunner = newLocalRunner(spawnChan, b.spawnCount, b.spawnRate)
 		for _, o := range b.outputs {
 			b.localRunner.addOutput(o)
 		}
@@ -217,29 +216,19 @@ func runTasksForTest(tasks ...*Task) {
 
 // Run accepts a slice of Task and connects to a locust master.
 // It's a convenience function to use the defaultBoomer.
-func Run(tasks ...*Task) {
+func Run(spawnChan chan *SpawnArgs) {
 	if !flag.Parsed() {
 		flag.Parse()
 	}
 
-	if runTasks != "" {
-		runTasksForTest(tasks...)
-		return
-	}
-
 	initLegacyEventHandlers()
 
-	rateLimiter, err := createRateLimiter(maxRPS, requestIncreaseRate)
-	if err != nil {
-		log.Fatalf("%v\n", err)
-	}
-	defaultBoomer.SetRateLimiter(rateLimiter)
 	defaultBoomer.masterHost = masterHost
 	defaultBoomer.masterPort = masterPort
 	defaultBoomer.EnableMemoryProfile(memoryProfileFile, memoryProfileDuration)
 	defaultBoomer.EnableCPUProfile(cpuProfileFile, cpuProfileDuration)
 
-	defaultBoomer.Run(tasks...)
+	defaultBoomer.Run(spawnChan)
 
 	quitByMe := false
 	quitChan := make(chan bool)

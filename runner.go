@@ -4,13 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math/rand"
 	"os"
 	"runtime/debug"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"github.com/sandwich-go/boost/xpanic"
 )
 
 const (
@@ -40,19 +40,14 @@ var ContextSpawnCountKey = spawnCount(struct{}{})
 
 type runner struct {
 	state string
-
-	tasks           []*Task
-	totalTaskWeight int
-
-	rateLimiter      RateLimiter
-	rateLimitEnabled bool
-	stats            *requestStats
+	stats *requestStats
 
 	// TODO: we save user_class_count in spawn message and send it back to master without modification, may be a bad idea?
 	userClassesCountFromMaster map[string]int64
 
-	numClients int32
-	spawnRate  float64
+	numClients int
+	spawnRate  int
+	spawnChan  chan *SpawnArgs
 
 	// all running workers(goroutines) will select on this channel.
 	// close this channel will stop all running workers.
@@ -133,96 +128,25 @@ func (r *runner) outputOnStop() {
 	wg.Wait()
 }
 
-func (r *runner) spawnWorkers(spawnCount int, quit chan bool, spawnCompleteFunc func()) {
-	log.Println("Spawning", spawnCount, "clients immediately")
-
-	for i := 1; i <= spawnCount; i++ {
-		select {
-		case <-quit:
-			// quit spawning goroutine
-			return
-		case <-r.shutdownChan:
-			return
-		default:
-			atomic.AddInt32(&r.numClients, 1)
-			go func(num int) {
-				ctx := context.WithValue(context.Background(), ContextSpawnNumberKey, num)
-				ctx = context.WithValue(ctx, ContextSpawnCountKey, spawnCount)
-				for {
-					select {
-					case <-quit:
-						return
-					case <-r.shutdownChan:
-						return
-					default:
-						if r.rateLimitEnabled {
-							blocked := r.rateLimiter.Acquire()
-							if !blocked {
-								task := r.getTask()
-								r.safeRun(ctx, task.Fn)
-							}
-						} else {
-							task := r.getTask()
-							r.safeRun(ctx, task.Fn)
-						}
-					}
-				}
-			}(i)
-		}
-	}
-
-	if spawnCompleteFunc != nil {
-		spawnCompleteFunc()
-	}
-}
-
-// setTasks will set the runner's task list AND the total task weight
-// which is used to get a random task later
-func (r *runner) setTasks(t []*Task) {
-	r.tasks = t
-
-	weightSum := 0
-	for _, task := range r.tasks {
-		weightSum += task.Weight
-	}
-	r.totalTaskWeight = weightSum
-}
-
-func (r *runner) getTask() *Task {
-	tasksCount := len(r.tasks)
-	if tasksCount == 1 {
-		// Fast path
-		return r.tasks[0]
-	}
-
-	rs := rand.New(rand.NewSource(time.Now().UnixNano()))
-
-	totalWeight := r.totalTaskWeight
-	if totalWeight <= 0 {
-		// If all the tasks have not weights defined, they have the same chance to run
-		randNum := rs.Intn(tasksCount)
-		return r.tasks[randNum]
-	}
-
-	randNum := rs.Intn(totalWeight)
-	runningSum := 0
-	for _, task := range r.tasks {
-		runningSum += task.Weight
-		if runningSum > randNum {
-			return task
-		}
-	}
-
-	return nil
-}
-
 func (r *runner) startSpawning(spawnCount int, spawnRate float64, spawnCompleteFunc func()) {
 	Events.Publish(EVENT_SPAWN, spawnCount, spawnRate)
 
 	r.stopChan = make(chan bool)
-	r.numClients = 0
+	r.numClients = spawnCount
 
-	go r.spawnWorkers(spawnCount, r.stopChan, spawnCompleteFunc)
+	log.Println("Spawning", spawnCount, "clients immediately")
+	select {
+	case <-r.spawnChan:
+	default:
+	}
+	select {
+	case r.spawnChan <- &SpawnArgs{Count: spawnCount, Rate: spawnRate}:
+	default:
+		log.Println("Failed to send spawn message to logic")
+	}
+	if spawnCompleteFunc != nil {
+		spawnCompleteFunc()
+	}
 }
 
 func (r *runner) stop() {
@@ -241,18 +165,12 @@ type localRunner struct {
 	spawnCount int
 }
 
-func newLocalRunner(tasks []*Task, rateLimiter RateLimiter, spawnCount int, spawnRate float64) (r *localRunner) {
+func newLocalRunner(spawnChan chan *SpawnArgs, spawnCount int, spawnRate int) (r *localRunner) {
 	r = &localRunner{}
-	r.setTasks(tasks)
 	r.spawnRate = spawnRate
 	r.spawnCount = spawnCount
+	r.spawnChan = spawnChan
 	r.shutdownChan = make(chan bool)
-
-	if rateLimiter != nil {
-		r.rateLimitEnabled = true
-		r.rateLimiter = rateLimiter
-	}
-
 	r.stats = newRequestStats()
 	return r
 }
@@ -262,8 +180,6 @@ func (r *localRunner) run() {
 	r.stats.start()
 	r.outputOnStart()
 
-	wg := sync.WaitGroup{}
-	wg.Add(1)
 	go func() {
 		for {
 			select {
@@ -273,27 +189,24 @@ func (r *localRunner) run() {
 			case <-r.shutdownChan:
 				Events.Publish(EVENT_QUIT)
 				r.stop()
-				wg.Done()
 				r.outputOnStop()
 				return
+			case <-time.After(time.Second):
+				if r.numClients < r.spawnCount {
+					totalCount := r.numClients + r.spawnRate
+					if totalCount > r.spawnCount {
+						totalCount = r.spawnCount
+					}
+					r.startSpawning(totalCount, float64(r.spawnRate), nil)
+				}
 			}
 		}
 	}()
-
-	if r.rateLimitEnabled {
-		r.rateLimiter.Start()
-	}
-	r.startSpawning(r.spawnCount, r.spawnRate, nil)
-
-	wg.Wait()
 }
 
 func (r *localRunner) shutdown() {
 	if r.stats != nil {
 		r.stats.close()
-	}
-	if r.rateLimitEnabled {
-		r.rateLimiter.Stop()
 	}
 	close(r.shutdownChan)
 }
@@ -310,20 +223,14 @@ type slaveRunner struct {
 	client                     client
 }
 
-func newSlaveRunner(masterHost string, masterPort int, tasks []*Task, rateLimiter RateLimiter) (r *slaveRunner) {
+func newSlaveRunner(masterHost string, masterPort int, spawnChan chan *SpawnArgs) (r *slaveRunner) {
 	r = &slaveRunner{}
 	r.masterHost = masterHost
 	r.masterPort = masterPort
-	r.setTasks(tasks)
+	r.spawnChan = spawnChan
 	r.waitForAck = sync.WaitGroup{}
 	r.nodeID = getNodeID()
 	r.shutdownChan = make(chan bool)
-
-	if rateLimiter != nil {
-		r.rateLimitEnabled = true
-		r.rateLimiter = rateLimiter
-	}
-
 	r.stats = newRequestStats()
 	return r
 }
@@ -348,9 +255,6 @@ func (r *slaveRunner) shutdown() {
 	}
 	if r.client != nil {
 		r.client.close()
-	}
-	if r.rateLimitEnabled {
-		r.rateLimiter.Stop()
 	}
 	close(r.shutdownChan)
 }
@@ -501,14 +405,10 @@ func (r *slaveRunner) run() {
 	r.stats.start()
 	r.outputOnStart()
 
-	if r.rateLimitEnabled {
-		r.rateLimiter.Start()
-	}
-
 	r.sendClientReadyAndWaitForAck()
 
 	// report to master
-	go func() {
+	go xpanic.AutoRecover("report to master", func() {
 		for {
 			select {
 			case data := <-r.stats.messageToRunnerChan:
@@ -524,11 +424,11 @@ func (r *slaveRunner) run() {
 				return
 			}
 		}
-	}()
+	})
 
 	// heartbeat
 	// See: https://github.com/locustio/locust/commit/a8c0d7d8c588f3980303358298870f2ea394ab93
-	go func() {
+	go xpanic.AutoRecover("heart beat", func() {
 		var ticker = time.NewTicker(heartbeatInterval)
 		for {
 			select {
@@ -543,7 +443,7 @@ func (r *slaveRunner) run() {
 				return
 			}
 		}
-	}()
+	})
 
 	Events.Subscribe(EVENT_QUIT, r.onQuiting)
 }
